@@ -1,7 +1,7 @@
 /* PKSYSTEM – service worker: aplikacja działa offline po pierwszym otwarciu.
    Pliki aplikacji są pobierane z sieci (zawsze aktualne), a gdy sieci nie ma lub jest wolna, używana jest zapisana kopia.
    Przy nowej wersji plików zmień numer w CACHE. */
-const CACHE = "pksystem-pilot-1-3";
+const CACHE = "pksystem-pilot-2-0";
 const CORE = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./icon-maskable-512.png", "./apple-touch-icon.png"];
 const NET_TIMEOUT_MS = 4000;
 
