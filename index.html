@@ -385,6 +385,16 @@ main{flex:1;display:flex;flex-direction:column;width:100%;min-width:0;padding-bo
 .tw.sm table{min-width:560px}
 .lg{margin-bottom:10px}
 select.in{appearance:auto}
+/* Microsoft 365 */
+.ms-acc{margin:4px 0 10px;font-size:15.5px}
+.ms-st{margin:10px 0 0;padding:9px 12px;border-radius:12px;background:var(--soft);font-size:15px}
+.ms-st.ok{background:var(--brandtint);color:var(--brand-deep)}
+.ms-st.err{background:var(--warn-bg);color:var(--warn-ink)}
+.cols3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;align-items:end}
+.cols3 label{font-size:14px}
+.ms-adv{margin-top:16px;border-top:1px solid var(--line);padding-top:10px}
+.ms-adv summary{cursor:pointer;font-weight:700;color:var(--brand);padding:6px 0}
+.ms .url{font-weight:700;color:var(--ink);word-break:break-all}
 </style>
 </head>
 <body>
@@ -1704,7 +1714,7 @@ window.PKQR=function(text){var QRCode=req("index"),L=req("QRErrorCorrectLevel");
    KONFIGURACJA – PIN, zmiany, operacje, powody pauz, pracownicy
    ================================================================== */
 const PIN = "1975";
-const VERSION = "pilot 2.0";
+const VERSION = "pilot 2.2";
 /* Godzin nie widać na ekranie. Służą tylko do oznaczania wpisów „do weryfikacji”. */
 const SHIFTS = [
   {id:1, name:"Zmiana 1", from:"06:00", to:"14:00"},
@@ -1729,10 +1739,18 @@ const REASONS = [
   {id:"przerwa", name:"Przerwa"},
   {id:"inne",    name:"Inne", text:true}
 ];
-/* DO PODMIANY: lista inicjałów pracowników (można też zmienić w Ustawieniach) */
-const DEFAULT_WORKERS = ["Rafał","Grzegorz","Kamil","Aleksandra","Daria","Monika","Tomek","Kazimierz"];
+/* Lista pracowników (można też zmienić w Ustawieniach) */
+const DEFAULT_WORKERS = ["Tomasz Z.","Kamil N.","Monika Z-K.","Daria C.","Dominika G.","Sebastian Z.","Mirek K.","Rafał Ku.",
+  "Karolina C.","Ania D.","Rafał Kr.","Rafał P.","Ola U.","Tomasz H.","Kinga K.","Grzegorz Ł."];
+const OLD_DEFAULT_WORKERS = ["Rafał","Grzegorz","Kamil","Aleksandra","Daria","Monika","Tomek","Kazimierz"];
 const IDLE_S = 30;       /* powrót do wyboru zmiany po bezczynności (s) */
 const MGR_IDLE_S = 180;  /* automatyczna blokada panelu kierownika (s) */
+/* Microsoft 365 – identyfikatory z Microsoft Entra (można też wpisać w Ustawieniach) */
+const MS_CLIENT_ID = "";  /* Identyfikator aplikacji (klienta) */
+const MS_TENANT_ID = "";  /* Identyfikator katalogu (dzierżawy) */
+const MS_REFRESH_MIN = 15; /* co ile minut pobierać listę projektów */
+/* Domyślne ustawienia odczytu listy z Excela */
+const MS_DEFAULT = {colC:"C", colP:"E", first:2};
 /* ================================================================== */
 
 const $=(s,r=document)=>r.querySelector(s);
@@ -1821,11 +1839,12 @@ function plistDedupe(arr){const seen=new Set(),out=[];arr.forEach(x=>{const k=x.
 const plistText=()=>cfg.plist.map(x=>x.c+"; "+x.p).join("\n");
 
 let cfg=store.get("pk_cfg",null)||{};
-cfg.workers=Array.isArray(cfg.workers)&&cfg.workers.length?cfg.workers:DEFAULT_WORKERS.slice();
+cfg.workers=Array.isArray(cfg.workers)&&cfg.workers.length&&cfg.workers.join("|")!==OLD_DEFAULT_WORKERS.join("|")?cfg.workers:DEFAULT_WORKERS.slice();
 cfg.deviceName=typeof cfg.deviceName==="string"?cfg.deviceName:"";
 cfg.timeUnit=["s","min","h"].indexOf(cfg.timeUnit)>=0?cfg.timeUnit:"s";
 if(!Array.isArray(cfg.plist))cfg.plist=plistFromText(typeof cfg.projects==="string"?cfg.projects:"");
 delete cfg.projects;delete cfg.device;
+cfg.ms=Object.assign({link:"",sheet:"",colC:MS_DEFAULT.colC,colP:MS_DEFAULT.colP,first:MS_DEFAULT.first,clientId:"",tenantId:"",driveId:"",itemId:"",fileName:"",resolvedFor:"",sheets:[],last:null,needLogin:false,silentFail:false},cfg.ms||{});
 
 let entries=store.get("pk_entries",[]);
 let active=store.get("pk_active",[]);
@@ -2121,6 +2140,7 @@ function renderMgr(){
     +'<button class="icon-btn lockbtn" id="lockBtn" aria-label="Zablokuj panel kierownika" title="Zablokuj">'+ICON_LOCK_S+'</button></div>';
   if(unsynced>0&&mgrTab!=="data")h+='<div class="banner"><span>Od ostatniego eksportu: '+unsynced+' '+plWpis(unsynced)+'.</span><button class="btn small brand" data-seg="data">Przejdź do eksportu</button></div>';
   if(!storageOk)h+='<div class="banner">Pamięć przeglądarki jest niedostępna – wpisy nie zostaną zapisane. Wyłącz tryb prywatny.</div>';
+  if(cfg.ms.needLogin&&msConfigured())h+='<div class="banner"><span>Microsoft 365: wymagane ponowne logowanie – lista projektów nie jest aktualizowana.</span><button class="btn small brand" data-ms="login">Zaloguj</button></div>';
   if(!cfg.plist.length&&mgrTab!=="settings")h+='<div class="banner"><span>Brak listy klientów i projektów – pracownicy nie mogą zacząć pracy.</span><button class="btn small brand" data-seg="settings">Wczytaj listę</button></div>';
   h+=mgrTab==="active"?mgrActive():mgrTab==="entries"?mgrEntries():mgrTab==="analysis"?mgrAnalysis():mgrTab==="data"?mgrData():mgrSettings();
   mgrEl.innerHTML=h;
@@ -2385,16 +2405,19 @@ async function buildXlsx(){
 
 /* --- odczyt plików Excel (pierwszy arkusz) --- */
 const textOf=el=>{let s="";Array.from(el.childNodes).forEach(n=>{const ln=n.localName;if(ln==="t")s+=n.textContent;else if(ln==="r")Array.from(n.childNodes).forEach(m=>{if(m.localName==="t")s+=m.textContent})});return s};
-async function readXlsx(buf){
+async function readXlsxBook(buf,sheetName){
   const zip=await JSZip.loadAsync(buf),dp=new DOMParser();
   const xml=async n=>{const f=zip.file(n);return f?dp.parseFromString(await f.async("string"),"application/xml"):null};
-  let name=null;
+  let name=null,sheet="",sheets=[];
   try{
     const wb=await xml("xl/workbook.xml"),rels=await xml("xl/_rels/workbook.xml.rels");
-    const sh=wb&&wb.getElementsByTagNameNS("*","sheet")[0];
-    if(sh&&rels){
+    const all=wb?Array.from(wb.getElementsByTagNameNS("*","sheet")):[];
+    sheets=all.map(x=>x.getAttribute("name")||"");
+    const sh=(sheetName&&all.find(x=>x.getAttribute("name")===sheetName))||all[0];
+    if(sh){
+      sheet=sh.getAttribute("name")||"";
       const rid=sh.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships","id")||sh.getAttribute("r:id");
-      const rel=Array.from(rels.getElementsByTagNameNS("*","Relationship")).find(r=>r.getAttribute("Id")===rid);
+      const rel=rels&&Array.from(rels.getElementsByTagNameNS("*","Relationship")).find(r=>r.getAttribute("Id")===rid);
       if(rel){let t=rel.getAttribute("Target").replace(/^\//,"");if(!/^xl\//.test(t))t="xl/"+t;name=t}
     }
   }catch(e){}
@@ -2403,7 +2426,7 @@ async function readXlsx(buf){
   let ss=[];const sd=await xml("xl/sharedStrings.xml");
   if(sd)ss=Array.from(sd.getElementsByTagNameNS("*","si")).map(textOf);
   const d=await xml(name),rows=[];
-  Array.from(d.getElementsByTagNameNS("*","row")).forEach(row=>{
+  Array.from(d.getElementsByTagNameNS("*","row")).forEach((row,ri)=>{
     const arr=[];
     Array.from(row.getElementsByTagNameNS("*","c")).forEach(c=>{
       const m=/^([A-Z]+)/.exec(c.getAttribute("r")||"");let ci=arr.length;
@@ -2416,11 +2439,13 @@ async function readXlsx(buf){
       }
       arr[ci]=v;
     });
-    for(let i=0;i<arr.length;i++)if(arr[i]===undefined)arr[i]="";
+    for(let k=0;k<arr.length;k++)if(arr[k]===undefined)arr[k]="";
+    arr.rowNum=+row.getAttribute("r")||(ri+1);
     rows.push(arr);
   });
-  return rows;
+  return {rows,sheet,sheets};
 }
+async function readXlsx(buf){return (await readXlsxBook(buf)).rows}
 function parseCsv(text){
   if(text.charCodeAt(0)===0xFEFF)text=text.slice(1);
   const first=text.split(/\r?\n/,1)[0]||"";
@@ -2569,6 +2594,257 @@ async function loadListFile(file){
   });
 }
 
+
+/* ==================================================================
+   MICROSOFT 365 – lista klientów i projektów z Excela w OneDrive / SharePoint
+   Logowanie: OAuth 2.0 (kod autoryzacji + PKCE), bez zewnętrznych bibliotek.
+   ================================================================== */
+const GRAPH="https://graph.microsoft.com/v1.0";
+const MS_SCOPES="openid profile offline_access https://graph.microsoft.com/Files.ReadWrite.All";
+const msId=()=>clean(cfg.ms.clientId)||MS_CLIENT_ID;
+const msTen=()=>clean(cfg.ms.tenantId)||MS_TENANT_ID;
+const msConfigured=()=>!!(msId()&&msTen()&&clean(cfg.ms.link));
+const redirectUri=()=>location.origin+location.pathname.replace(/index\.html$/,"");
+let msTok=store.get("pk_ms_tok",null);
+let msBusy=false,msLastTry=0,afterPinTab=null;
+
+const b64url=buf=>{let s="";new Uint8Array(buf).forEach(b=>{s+=String.fromCharCode(b)});return btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")};
+const randStr=n=>b64url(crypto.getRandomValues(new Uint8Array(n)));
+const encShare=url=>"u!"+btoa(unescape(encodeURIComponent(url))).replace(/=+$/,"").replace(/\//g,"_").replace(/\+/g,"-");
+function jwtClaims(t){
+  try{let p=String(t).split(".")[1].replace(/-/g,"+").replace(/_/g,"/");while(p.length%4)p+="=";return JSON.parse(decodeURIComponent(escape(atob(p))))}catch(e){return null}
+}
+function msErr(kind,msg){const e=new Error(msg);e.kind=kind;return e}
+const colIdx=l=>{let n=0;for(const ch of String(l).toUpperCase())n=n*26+(ch.charCodeAt(0)-64);return n-1};
+
+async function msLogin(silent){
+  if(!msId()||!msTen()){toast("Uzupełnij identyfikatory aplikacji i katalogu (Ustawienia → Microsoft 365)");return}
+  if(!(window.crypto&&crypto.subtle)){toast("Logowanie działa tylko na adresie https");return}
+  if(!navigator.onLine){toast("Brak internetu – logowanie niemożliwe");return}
+  const ver=randStr(48),state=randStr(16);
+  const ch=b64url(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(ver)));
+  store.set("pk_ms_pkce",{ver,state,silent:!!silent,at:Date.now()});
+  const p=new URLSearchParams({client_id:msId(),response_type:"code",redirect_uri:redirectUri(),response_mode:"fragment",
+    scope:MS_SCOPES,state,code_challenge:ch,code_challenge_method:"S256"});
+  if(silent){p.set("prompt","none");if(msTok&&msTok.user)p.set("login_hint",msTok.user)}
+  else p.set("prompt","select_account");
+  location.assign("https://login.microsoftonline.com/"+encodeURIComponent(msTen())+"/oauth2/v2.0/authorize?"+p.toString());
+}
+async function msToken(extra){
+  const body=new URLSearchParams(Object.assign({client_id:msId(),scope:MS_SCOPES},extra));
+  let r;
+  try{r=await fetch("https://login.microsoftonline.com/"+encodeURIComponent(msTen())+"/oauth2/v2.0/token",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body})}
+  catch(e){throw msErr("net","Brak połączenia z Microsoft 365.")}
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok||!j.access_token){
+    const e=msErr(/invalid_grant|interaction_required|login_required/.test(j.error||"")?"login":"api",
+      "Microsoft odrzucił logowanie: "+(j.error||("HTTP "+r.status))+(j.error_description?" – "+String(j.error_description).split(/\r?\n/)[0].slice(0,200):""));
+    e.code=j.error||"";throw e;
+  }
+  const now=Date.now(),idc=jwtClaims(j.id_token)||{},prev=msTok||{};
+  const rtExp=j.refresh_token_expires_in?now+(+j.refresh_token_expires_in)*1000-5*6e4
+    :extra.grant_type==="authorization_code"?now+24*36e5-5*6e4:(prev.rtExp||now+24*36e5);
+  msTok={at:j.access_token,atExp:now+(+j.expires_in||3600)*1000-2*6e4,rt:j.refresh_token||prev.rt||"",rtExp,
+    user:idc.preferred_username||idc.upn||prev.user||"",name:idc.name||prev.name||""};
+  store.set("pk_ms_tok",msTok);
+  return msTok;
+}
+async function msHandleRedirect(){
+  const h=location.hash.slice(1);if(!h)return;
+  const q=new URLSearchParams(h);
+  if(!q.has("state")||!(q.has("code")||q.has("error")))return;
+  history.replaceState(null,"",location.pathname+location.search);
+  const pk=store.get("pk_ms_pkce",null);store.set("pk_ms_pkce",null);
+  if(!pk||pk.state!==q.get("state")){msSetErr("Logowanie przerwane (nieprawidłowy stan) – spróbuj ponownie.");return}
+  if(q.has("error")){
+    if(pk.silent){cfg.ms.needLogin=true;cfg.ms.silentFail=true;saveCfg();return}
+    msSetErr("Logowanie nieudane: "+q.get("error")+(q.get("error_description")?" – "+q.get("error_description").split(/\r?\n/)[0].slice(0,200):""));
+    toast("Logowanie nieudane");afterPinTab="settings";setTab("mgr");return;
+  }
+  try{
+    await msToken({grant_type:"authorization_code",code:q.get("code"),redirect_uri:redirectUri(),code_verifier:pk.ver});
+    cfg.ms.needLogin=false;cfg.ms.silentFail=false;saveCfg();
+    if(!pk.silent){toast("Zalogowano: "+(msTok.user||"konto Microsoft"));afterPinTab="settings";setTab("mgr")}
+    msRefresh(!pk.silent);
+  }catch(e){
+    if(pk.silent){cfg.ms.needLogin=true;cfg.ms.silentFail=true;saveCfg();return}
+    msSetErr(e.message);afterPinTab="settings";setTab("mgr");
+  }
+}
+async function msAccess(){
+  if(!msTok)throw msErr("login","Brak logowania do Microsoft 365.");
+  if(msTok.at&&Date.now()<msTok.atExp)return msTok.at;
+  if(!msTok.rt||Date.now()>msTok.rtExp)throw msErr("login","Logowanie wygasło – wymagane ponowne logowanie.");
+  await msToken({grant_type:"refresh_token",refresh_token:msTok.rt});
+  return msTok.at;
+}
+async function graphFetch(path,tok){
+  try{return await fetch(GRAPH+path,{headers:{Authorization:"Bearer "+tok}})}
+  catch(e){throw msErr("net","Brak połączenia z Microsoft 365.")}
+}
+async function graph(path){
+  let r=await graphFetch(path,await msAccess());
+  if(r.status===401&&msTok){msTok.atExp=0;r=await graphFetch(path,await msAccess())}
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){
+    const c=(j.error&&j.error.code)||("HTTP "+r.status),m=(j.error&&j.error.message)||"";
+    const msg=r.status===403||/accessDenied/i.test(c)?"Brak dostępu do pliku dla konta "+((msTok&&msTok.user)||"")+". Udostępnij plik temu kontu."
+      :r.status===404||/itemNotFound/i.test(c)?"Nie znaleziono pliku lub arkusza – sprawdź link i arkusz."
+      :r.status===429||r.status>=500?"Microsoft 365 chwilowo nie odpowiada – ponowię próbę później."
+      :"Błąd Microsoft 365.";
+    const e=msErr(r.status===429||r.status>=500?"net":"api",msg+" ["+c+(m?": "+String(m).slice(0,160):"")+"]");e.status=r.status;throw e;
+  }
+  return j;
+}
+async function msResolve(){
+  const link=clean(cfg.ms.link);
+  if(!link)throw msErr("cfg","Wklej link do pliku Excel.");
+  if(!/^https:\/\//i.test(link))throw msErr("cfg","Link musi zaczynać się od https:// (OneDrive: Udostępnij → Kopiuj link).");
+  if(cfg.ms.resolvedFor===link&&cfg.ms.driveId&&cfg.ms.itemId)return;
+  const j=await graph("/shares/"+encShare(link)+"/driveItem?$select=id,name,parentReference,file");
+  if(!j.parentReference||!j.parentReference.driveId||!j.id)throw msErr("api","Link nie prowadzi do pliku.");
+  if(!/\.xlsx$/i.test(j.name||""))throw msErr("cfg","To nie jest plik .xlsx („"+(j.name||"?")+"”).");
+  Object.assign(cfg.ms,{driveId:j.parentReference.driveId,itemId:j.id,fileName:j.name,resolvedFor:link});saveCfg();
+}
+const itemBase=()=>"/drives/"+encodeURIComponent(cfg.ms.driveId)+"/items/"+encodeURIComponent(cfg.ms.itemId);
+function msRowsToList(rows,ci,pi){
+  return plistDedupe(rows.map(r=>({c:cellStr(r[ci]),p:cellStr(r[pi])})).filter(x=>x.c&&x.p));
+}
+/* odczyt przez Excel w Microsoft 365 (arkusz → zakres kolumn) */
+async function msReadWorkbook(){
+  const sj=await graph(itemBase()+"/workbook/worksheets?$select=id,name,position");
+  const sheets=(sj.value||[]).sort((a,b)=>a.position-b.position);
+  if(!sheets.length)throw msErr("api","Plik nie ma arkuszy.");
+  const sh=cfg.ms.sheet?sheets.find(s=>s.name===cfg.ms.sheet):sheets[0];
+  if(!sh)throw msErr("cfg","W pliku nie ma arkusza „"+cfg.ms.sheet+"”.");
+  const ws=itemBase()+"/workbook/worksheets/"+encodeURIComponent(sh.id);
+  const ur=await graph(ws+"/usedRange(valuesOnly=true)?$select=address,rowIndex,rowCount");
+  const first=Math.max(1,parseInt(cfg.ms.first,10)||1),last=(+ur.rowIndex||0)+(+ur.rowCount||0);
+  const ci=colIdx(cfg.ms.colC),pi=colIdx(cfg.ms.colP),lo=Math.min(ci,pi),hi=Math.max(ci,pi);
+  let rows=[];
+  if(last>=first){
+    const rg=await graph(ws+"/range(address='"+colL(lo)+first+":"+colL(hi)+last+"')?$select=text");
+    rows=(rg.text||[]).map(r=>{const a=[];a[ci]=r[ci-lo];a[pi]=r[pi-lo];return a});
+  }
+  return {list:msRowsToList(rows,ci,pi),sheet:sh.name,sheets:sheets.map(s=>s.name)};
+}
+/* zapasowo: pobranie całego pliku i odczyt na urządzeniu */
+async function msReadDownload(){
+  const it=await graph(itemBase()+"?$select=id,name,@microsoft.graph.downloadUrl");
+  const url=it["@microsoft.graph.downloadUrl"];
+  if(!url)throw msErr("api","Microsoft nie udostępnił pliku do pobrania.");
+  let r;try{r=await fetch(url)}catch(e){throw msErr("net","Nie udało się pobrać pliku z Microsoft 365.")}
+  if(!r.ok)throw msErr("api","Pobieranie pliku nieudane [HTTP "+r.status+"].");
+  const book=await readXlsxBook(await r.arrayBuffer(),cfg.ms.sheet);
+  if(cfg.ms.sheet&&book.sheet!==cfg.ms.sheet)throw msErr("cfg","W pliku nie ma arkusza „"+cfg.ms.sheet+"”.");
+  const first=Math.max(1,parseInt(cfg.ms.first,10)||1),ci=colIdx(cfg.ms.colC),pi=colIdx(cfg.ms.colP);
+  return {list:msRowsToList(book.rows.filter(r=>(r.rowNum||0)>=first),ci,pi),sheet:book.sheet,sheets:book.sheets};
+}
+async function msFetchList(){
+  await msResolve();
+  try{return await msReadWorkbook()}
+  catch(e){
+    if(e.kind==="login"||e.kind==="net"||e.kind==="cfg")throw e;
+    try{return await msReadDownload()}catch(e2){if(e2.kind==="cfg")throw e2;throw e}
+  }
+}
+function msSetErr(msg){const L=cfg.ms.last||{};L.err=msg;L.errAt=Date.now();cfg.ms.last=L;saveCfg();msPaint()}
+async function msRefresh(manual){
+  if(msBusy||!msConfigured())return;
+  if(!msTok){if(manual)toast("Najpierw zaloguj się do Microsoft 365");return}
+  msBusy=true;msLastTry=Date.now();msPaint();
+  try{
+    const r=await msFetchList();
+    if(!r.list.length)throw msErr("cfg","Pobrano 0 projektów – sprawdź arkusz, kolumny ("+cfg.ms.colC+", "+cfg.ms.colP+") i wiersz startowy ("+cfg.ms.first+").");
+    cfg.plist=r.list;cfg.plistSrc={name:"Microsoft 365: "+(cfg.ms.fileName||"plik")+" ("+r.sheet+")",at:Date.now()};
+    cfg.ms.sheets=r.sheets;cfg.ms.needLogin=false;
+    cfg.ms.last={at:Date.now(),n:r.list.length,clients:new Set(r.list.map(x=>x.c)).size,sheet:r.sheet,err:"",errAt:0};
+    saveCfg();
+    if(manual)toast("Pobrano "+r.list.length+" projektów z Microsoft 365");
+  }catch(e){
+    if(e.kind==="login")cfg.ms.needLogin=true;
+    const L=cfg.ms.last||{};L.err=e.message;L.errAt=Date.now();cfg.ms.last=L;saveCfg();
+    if(manual)toast(e.kind==="net"?"Brak połączenia – używam zapisanej listy":"Nie udało się pobrać listy – szczegóły w Ustawieniach");
+  }finally{msBusy=false;msPaint();if(tab==="mgr"&&unlocked&&mgrTab!=="settings")renderMgr()}
+}
+function msTick(force){
+  if(!msConfigured()||!msTok)return;
+  const due=force||!cfg.ms.last||!cfg.ms.last.at||Date.now()-cfg.ms.last.at>MS_REFRESH_MIN*6e4;
+  if(due&&Date.now()-msLastTry>(force?6e4:5*6e4)&&navigator.onLine)msRefresh(false);
+  msSilentCheck();
+}
+/* ciche odnowienie logowania: tylko na ekranie wyboru zmiany, po bezczynności, najwyżej raz na godzinę */
+function msSilentCheck(){
+  if(!msConfigured()||!msTok||!msTok.user||cfg.ms.silentFail||!navigator.onLine)return;
+  const soon=!msTok.rt||Date.now()>msTok.rtExp-15*6e4;
+  if(!(cfg.ms.needLogin||soon))return;
+  if(!(tab==="home"&&flow.step===1&&!dlg.open)||Date.now()-lastTouch<IDLE_S*1000)return;
+  if(Date.now()-store.get("pk_ms_silent",0)<60*6e4)return;
+  store.set("pk_ms_silent",Date.now());msLogin(true);
+}
+function msStatusHtml(){
+  const L=cfg.ms.last||{};let h="";
+  if(msBusy)h+='<p class="ms-st">Pobieranie listy…</p>';
+  if(L.at)h+='<p class="ms-st ok">Ostatnio pobrano: <b>'+fmtDate(L.at)+' '+fmtHM(L.at)+'</b> – '+L.n+' projektów od '+L.clients+' klientów'+(L.sheet?' (arkusz „'+esc(L.sheet)+'”)':'')+'.</p>';
+  if(L.err&&L.errAt>=(L.at||0))h+='<p class="ms-st err"><b>Błąd ('+fmtHM(L.errAt)+'):</b> '+esc(L.err)+'</p>';
+  if(cfg.ms.needLogin)h+='<p class="ms-st err">Wymagane ponowne logowanie. Pracownicy korzystają z ostatnio pobranej listy.</p>';
+  if(L.at&&cfg.plist.length)h+='<p class="muted" style="margin:8px 0 0">Przykład z listy:</p><ul class="prev">'+cfg.plist.slice(0,5).map(x=>'<li>'+esc(x.c)+' · '+esc(x.p)+'</li>').join("")+'</ul>';
+  return h||'<p class="ms-st">Lista nie była jeszcze pobierana.</p>';
+}
+function msPaint(){
+  const s=$("#msStat");if(s)s.innerHTML=msStatusHtml();
+  const sel=$("#msSheet");
+  if(sel&&document.activeElement!==sel){
+    const names=(cfg.ms.sheets||[]).slice();if(cfg.ms.sheet&&names.indexOf(cfg.ms.sheet)<0)names.unshift(cfg.ms.sheet);
+    const cur=Array.from(sel.options).slice(1).map(o=>o.value);
+    if(cur.join("\u0001")!==names.join("\u0001")){const v=sel.value;sel.innerHTML='<option value="">Pierwszy arkusz w pliku</option>'+names.map(n=>'<option'+(n===v?' selected':'')+'>'+esc(n)+'</option>').join("")}
+  }
+  $$("[data-ms='refresh'],[data-ms='save']").forEach(b=>{b.disabled=msBusy});
+}
+function msPanel(){
+  const ids=!!(msId()&&msTen()),sheets=(cfg.ms.sheets||[]).slice();
+  if(cfg.ms.sheet&&sheets.indexOf(cfg.ms.sheet)<0)sheets.unshift(cfg.ms.sheet);
+  return '<div class="panel ms"><h3>Microsoft 365 – lista z Excela</h3><p class="sub2">Lista klientów i projektów pobierana z pliku w OneDrive lub SharePoincie przy uruchomieniu i co '+MS_REFRESH_MIN+' min.</p>'
+    +'<div class="ms-acc">'+(msTok?'Zalogowano: <b>'+esc(msTok.user||msTok.name||"konto Microsoft")+'</b>':'Nie zalogowano.')+'</div>'
+    +'<div class="fileline">'+(msTok?'<button class="btn ghost small" data-ms="login">Zaloguj ponownie</button><button class="btn ghost small" data-ms="logout">Wyloguj</button>'
+      :'<button class="btn brand" data-ms="login"'+(ids?'':' disabled')+'>Zaloguj do Microsoft 365</button>')+'</div>'
+    +(ids?'':'<p class="hint warn">Najpierw wpisz identyfikatory aplikacji i katalogu (na dole tego panelu).</p>')
+    +'<label for="msLink">Link do pliku (OneDrive: Udostępnij → Kopiuj link)</label><input class="in" id="msLink" type="url" inputmode="url" autocomplete="off" placeholder="https://…sharepoint.com/:x:/…" value="'+esc(cfg.ms.link)+'">'
+    +'<label for="msSheet">Arkusz</label><select class="in" id="msSheet"><option value="">Pierwszy arkusz w pliku</option>'+sheets.map(s=>'<option'+(s===cfg.ms.sheet?' selected':'')+'>'+esc(s)+'</option>').join("")+'</select>'
+    +'<div class="cols3"><div><label for="msColC">Kolumna klienta</label><input class="in" id="msColC" maxlength="3" autocomplete="off" value="'+esc(cfg.ms.colC)+'"></div>'
+    +'<div><label for="msColP">Kolumna projektu</label><input class="in" id="msColP" maxlength="3" autocomplete="off" value="'+esc(cfg.ms.colP)+'"></div>'
+    +'<div><label for="msFirst">Dane od wiersza</label><input class="in" id="msFirst" type="number" inputmode="numeric" min="1" step="1" value="'+esc(cfg.ms.first)+'"></div></div>'
+    +'<div class="fileline"><button class="btn brand" data-ms="save">Zapisz i sprawdź</button><button class="btn ghost" data-ms="refresh">Odśwież teraz</button></div>'
+    +'<div id="msStat" aria-live="polite">'+msStatusHtml()+'</div>'
+    +'<details class="ms-adv"'+(ids?'':' open')+'><summary>Identyfikatory aplikacji (Microsoft Entra)</summary>'
+    +'<label for="msCid">Identyfikator aplikacji (klienta)</label><input class="in" id="msCid" autocomplete="off" spellcheck="false" value="'+esc(msId())+'">'
+    +'<label for="msTid">Identyfikator katalogu (dzierżawy)</label><input class="in" id="msTid" autocomplete="off" spellcheck="false" value="'+esc(msTen())+'">'
+    +'<p class="muted" style="margin-top:10px">Adres przekierowania do wpisania w Microsoft Entra (platforma „Aplikacja jednostronicowa”):<br><b class="url">'+esc(redirectUri())+'</b></p></details></div>';
+}
+function msSaveInputs(){
+  const g=id=>{const el=$("#"+id);return el?el.value:null};
+  if(g("msLink")===null)return {ok:true};
+  const link=clean(g("msLink")),c=g("msColC").trim().toUpperCase(),p=g("msColP").trim().toUpperCase(),first=parseInt(g("msFirst"),10);
+  if(!/^[A-Z]{1,3}$/.test(c)||!/^[A-Z]{1,3}$/.test(p))return {ok:false,msg:"Kolumny wpisz literami, np. C i E."};
+  if(c===p)return {ok:false,msg:"Kolumna klienta i projektu muszą być różne."};
+  if(!(first>=1&&first<=1048576))return {ok:false,msg:"„Dane od wiersza” to numer wiersza, np. 2."};
+  if(link!==cfg.ms.resolvedFor){cfg.ms.driveId="";cfg.ms.itemId="";cfg.ms.fileName=""}
+  Object.assign(cfg.ms,{link,sheet:g("msSheet")||"",colC:c,colP:p,first,clientId:clean(g("msCid")),tenantId:clean(g("msTid"))});
+  saveCfg();return {ok:true};
+}
+function msAction(a){
+  if(a==="login"){const s=msSaveInputs();if(!s.ok){toast(s.msg);return}msLogin(false);return}
+  if(a==="logout"){msTok=null;store.set("pk_ms_tok",null);cfg.ms.needLogin=false;cfg.ms.silentFail=false;saveCfg();renderMgr();toast("Wylogowano z Microsoft 365. Zapisana lista zostaje.");return}
+  if(a==="save"){
+    const s=msSaveInputs();if(!s.ok){toast(s.msg);return}
+    renderMgr();
+    if(!msTok){toast("Zapisano. Teraz zaloguj się do Microsoft 365.");return}
+    if(!clean(cfg.ms.link)){toast("Zapisano. Wklej link do pliku.");return}
+    msRefresh(true);return;
+  }
+  if(a==="refresh"){if(!msConfigured()){toast("Uzupełnij link do pliku i identyfikatory");return}msRefresh(true)}
+}
+
 /* ---- Ustawienia ---- */
 let installEvt=null;
 const standalone=()=>{try{return matchMedia("(display-mode: standalone)").matches||navigator.standalone===true}catch(e){return false}};
@@ -2584,10 +2860,11 @@ function installPanel(){
 }
 function mgrSettings(){
   const src=cfg.plistSrc?'Ostatnio wczytany plik: <b>'+esc(cfg.plistSrc.name)+'</b> ('+fmtDate(cfg.plistSrc.at)+' '+fmtHM(cfg.plistSrc.at)+').':'Lista nie była jeszcze wczytywana z pliku.';
-  return '<div class="setgrid">'
+  return '<div class="setgrid">'+msPanel()
    +'<div class="panel"><h3>Lista klientów i projektów</h3><p class="sub2">Na liście: <b>'+cfg.plist.length+'</b> projektów od <b>'+clientsList().length+'</b> klientów. '+src+'</p>'
    +'<div class="fileline"><input type="file" id="listFile" accept=".xlsx,.csv" hidden><button class="btn brand" data-pick="listFile">Wczytaj listę z Excela</button></div>'
-   +'<p class="muted">Plik musi mieć wiersz nagłówków, np. „Klient” i „Projekt”. Wczytanie zastępuje obecną listę. Plik jest odczytywany tylko na tym urządzeniu.</p>'
+   +(msConfigured()?'<p class="hint warn">Lista jest pobierana z Microsoft 365 – ręczne zmiany zostaną zastąpione przy następnym odświeżeniu.</p>':'')
+   +'<p class="muted">Zapasowo: wczytanie pliku z urządzenia. Plik musi mieć wiersz nagłówków, np. „Klient” i „Projekt”. Wczytanie zastępuje obecną listę.</p>'
    +'<label for="setP">Edycja ręczna (Klient; Projekt – jeden w wierszu)</label><textarea class="in" id="setP" rows="7" placeholder="ABC Systemy; 2026-ABC-014">'+esc(plistText())+'</textarea><button class="btn ghost small" style="margin-top:10px" data-save="projects">Zapisz listę</button></div>'
    +'<div class="panel"><h3>Pracownicy</h3><p class="sub2">Jedna osoba (inicjały) w wierszu. Lista pojawia się na ekranie wyboru.</p><textarea class="in" id="setW" rows="8">'+esc(cfg.workers.join("\n"))+'</textarea><button class="btn brand small" style="margin-top:10px" data-save="workers">Zapisz pracowników</button></div>'
    +'<div class="panel"><h3>Nazwa urządzenia</h3><p class="sub2">Trafia do nazwy pliku i do kolumny „Urządzenie” w eksporcie, np. „Hala – tablet 1”.</p><input class="in" id="setDev" maxlength="30" value="'+esc(cfg.deviceName)+'" placeholder="Hala"><button class="btn brand small" style="margin-top:10px" data-save="device">Zapisz nazwę</button></div>'
@@ -2611,6 +2888,7 @@ mgrEl.addEventListener("click",e=>{
   const b=e.target.closest("button");if(!b)return;
   const d=b.dataset;
   if(b.id==="pinOk"){checkPin();return}
+  if(d.ms){msAction(d.ms);return}
   if(b.id==="lockBtn"){unlocked=false;resetFlow();setTab("home");return}
   if(d.seg){mgrTab=d.seg;renderMgr();window.scrollTo(0,0);return}
   if(d.act==="edit"){openActiveEdit(d.id);return}
@@ -2629,7 +2907,7 @@ mgrEl.addEventListener("click",e=>{
   if(d.export){doExport(d.export);return}
   if(d.pick){$("#"+d.pick).click();return}
   if(d.cfgexp){
-    const f=new File([JSON.stringify({workers:cfg.workers,plist:cfg.plist,deviceName:cfg.deviceName,timeUnit:cfg.timeUnit},null,1)],"PKSYSTEM_ustawienia.json",{type:"application/json"});
+    const f=new File([JSON.stringify({workers:cfg.workers,plist:cfg.plist,deviceName:cfg.deviceName,timeUnit:cfg.timeUnit,ms:{link:cfg.ms.link,sheet:cfg.ms.sheet,colC:cfg.ms.colC,colP:cfg.ms.colP,first:cfg.ms.first,clientId:cfg.ms.clientId,tenantId:cfg.ms.tenantId}},null,1)],"PKSYSTEM_ustawienia.json",{type:"application/json"});
     shareFile(f,"PKSYSTEM – ustawienia","Ustawienia aplikacji PKSYSTEM").then(r=>{if(r==="downloaded")toast("Plik ustawień zapisany na urządzeniu")});return;
   }
   if(d.save==="workers"){
@@ -2658,6 +2936,7 @@ mgrEl.addEventListener("change",e=>{
       else if(typeof j.projects==="string")cfg.plist=plistFromText(j.projects);
       if(typeof j.deviceName==="string")cfg.deviceName=clean(j.deviceName).slice(0,30);
       if(["s","min","h"].indexOf(j.timeUnit)>=0)cfg.timeUnit=j.timeUnit;
+      if(j.ms&&typeof j.ms==="object"){["link","sheet","colC","colP","clientId","tenantId"].forEach(k=>{if(typeof j.ms[k]==="string")cfg.ms[k]=clean(j.ms[k])});if(+j.ms.first>=1)cfg.ms.first=+j.ms.first;cfg.ms.driveId="";cfg.ms.itemId=""}
       saveCfg();renderMgr();toast("Wczytano ustawienia");
     }).catch(()=>toast("Plik ustawień jest uszkodzony"));
   }
@@ -2665,7 +2944,7 @@ mgrEl.addEventListener("change",e=>{
 mgrEl.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.id==="pin")checkPin()});
 function checkPin(){
   const v=$("#pin").value;
-  if(v===PIN){unlocked=true;mgrTab="active";renderMgr()}
+  if(v===PIN){unlocked=true;mgrTab=afterPinTab||"active";afterPinTab=null;renderMgr()}
   else{$("#pinErr").textContent="Nieprawidłowy PIN.";$("#pin").value="";$("#pin").focus()}
 }
 
@@ -2711,6 +2990,9 @@ async function forceUpdate(){
 applyTheme(store.get("pk_theme",null));
 setTab("home");
 checkRot();
+msHandleRedirect().catch(()=>{}).finally(()=>setTimeout(()=>msTick(true),1500));
+setInterval(()=>msTick(false),30000);
+window.addEventListener("online",()=>msTick(true));
 if("serviceWorker" in navigator&&(location.protocol==="https:"||location.hostname==="localhost"||location.hostname==="127.0.0.1")){
   const hadCtl=!!navigator.serviceWorker.controller;
   navigator.serviceWorker.addEventListener("controllerchange",()=>{
