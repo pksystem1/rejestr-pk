@@ -1714,7 +1714,7 @@ window.PKQR=function(text){var QRCode=req("index"),L=req("QRErrorCorrectLevel");
    KONFIGURACJA – PIN, zmiany, operacje, powody pauz, pracownicy
    ================================================================== */
 const PIN = "1975";
-const VERSION = "pilot 2.2";
+const VERSION = "pilot 2.3";
 /* Godzin nie widać na ekranie. Służą tylko do oznaczania wpisów „do weryfikacji”. */
 const SHIFTS = [
   {id:1, name:"Zmiana 1", from:"06:00", to:"14:00"},
@@ -1844,7 +1844,8 @@ cfg.deviceName=typeof cfg.deviceName==="string"?cfg.deviceName:"";
 cfg.timeUnit=["s","min","h"].indexOf(cfg.timeUnit)>=0?cfg.timeUnit:"s";
 if(!Array.isArray(cfg.plist))cfg.plist=plistFromText(typeof cfg.projects==="string"?cfg.projects:"");
 delete cfg.projects;delete cfg.device;
-cfg.ms=Object.assign({link:"",sheet:"",colC:MS_DEFAULT.colC,colP:MS_DEFAULT.colP,first:MS_DEFAULT.first,clientId:"",tenantId:"",driveId:"",itemId:"",fileName:"",resolvedFor:"",sheets:[],last:null,needLogin:false,silentFail:false},cfg.ms||{});
+if(!cfg.imp||typeof cfg.imp!=="object")cfg.imp={sheet:"",ci:null,pi:null,skipHidden:true};
+cfg.ms=Object.assign({skipHidden:true,link:"",sheet:"",colC:MS_DEFAULT.colC,colP:MS_DEFAULT.colP,first:MS_DEFAULT.first,clientId:"",tenantId:"",driveId:"",itemId:"",fileName:"",resolvedFor:"",sheets:[],last:null,needLogin:false,silentFail:false},cfg.ms||{});
 
 let entries=store.get("pk_entries",[]);
 let active=store.get("pk_active",[]);
@@ -2408,12 +2409,14 @@ const textOf=el=>{let s="";Array.from(el.childNodes).forEach(n=>{const ln=n.loca
 async function readXlsxBook(buf,sheetName){
   const zip=await JSZip.loadAsync(buf),dp=new DOMParser();
   const xml=async n=>{const f=zip.file(n);return f?dp.parseFromString(await f.async("string"),"application/xml"):null};
-  let name=null,sheet="",sheets=[];
+  let name=null,sheet="",sheets=[],sheetsInfo=[];
   try{
     const wb=await xml("xl/workbook.xml"),rels=await xml("xl/_rels/workbook.xml.rels");
     const all=wb?Array.from(wb.getElementsByTagNameNS("*","sheet")):[];
+    const isHid=x=>/hidden/i.test(x.getAttribute("state")||"");
     sheets=all.map(x=>x.getAttribute("name")||"");
-    const sh=(sheetName&&all.find(x=>x.getAttribute("name")===sheetName))||all[0];
+    sheetsInfo=all.map(x=>({name:x.getAttribute("name")||"",hidden:isHid(x)}));
+    const sh=(sheetName&&all.find(x=>x.getAttribute("name")===sheetName))||all.find(x=>!isHid(x))||all[0];
     if(sh){
       sheet=sh.getAttribute("name")||"";
       const rid=sh.getAttributeNS("http://schemas.openxmlformats.org/officeDocument/2006/relationships","id")||sh.getAttribute("r:id");
@@ -2441,9 +2444,10 @@ async function readXlsxBook(buf,sheetName){
     });
     for(let k=0;k<arr.length;k++)if(arr[k]===undefined)arr[k]="";
     arr.rowNum=+row.getAttribute("r")||(ri+1);
+    arr.hidden=/^(1|true)$/i.test(row.getAttribute("hidden")||"");
     rows.push(arr);
   });
-  return {rows,sheet,sheets};
+  return {rows,sheet,sheets,sheetsInfo};
 }
 async function readXlsx(buf){return (await readXlsxBook(buf)).rows}
 function parseCsv(text){
@@ -2568,32 +2572,74 @@ function mgrData(){
 /* ---- Lista klientów i projektów z Excela ---- */
 const cellStr=v=>typeof v==="number"?String(v):clean(v);
 async function loadListFile(file){
-  if(!/\.(xlsx|csv)$/i.test(file.name)){toast("Wybierz plik .xlsx albo .csv");return}
-  let rows;
-  try{rows=await readTable(file)}catch(err){toast("Nie udało się odczytać pliku");return}
-  if(rows.length<2){toast("Plik nie zawiera danych");return}
-  const head=rows[0].map(x=>String(x).trim()),body=rows.slice(1);
-  let ci=head.findIndex(h=>/klient/i.test(h)),pi=head.findIndex(h=>/projekt/i.test(h));
-  if(ci<0)ci=0;if(pi<0)pi=head.length>1?(ci===0?1:0):0;
-  const opts=sel=>head.map((h,i)=>'<option value="'+i+'"'+(i===sel?' selected':'')+'>'+esc(h||("Kolumna "+colL(i)))+'</option>').join("");
-  const build=()=>plistDedupe(body.map(r=>({c:cellStr(r[+$("#m_c").value]),p:cellStr(r[+$("#m_p").value])})).filter(x=>x.c&&x.p));
+  const isX=/\.xlsx$/i.test(file.name);
+  if(!isX&&!/\.csv$/i.test(file.name)){toast("Wybierz plik .xlsx albo .csv");return}
+  let raw;
+  try{raw=await readFile(file,isX)}catch(err){toast("Nie udało się odczytać pliku – skopiuj go na pulpit i spróbuj ponownie");return}
+  const imp=cfg.imp;
+  let book=null,sheetName=imp.sheet||"",skip=imp.skipHidden!==false;
+  const load=async name=>{
+    if(isX){const b=await readXlsxBook(raw,name||null);return b}
+    return {rows:parseCsv(String(raw)),sheet:"",sheets:[],sheetsInfo:[]};
+  };
+  try{book=await load(sheetName)}catch(err){toast("Nie udało się odczytać pliku Excel");return}
+  sheetName=book.sheet;
+  const nonEmpty=r=>r.some(c=>String(c).trim()!=="");
+  let head=[],body=[],ci=0,pi=1,firstLoad=true;
+  const prep=()=>{
+    const rows=book.rows.filter(nonEmpty);
+    const hi=rows.findIndex(r=>!r.hidden);
+    head=hi<0?[]:rows[hi].map(x=>String(x).trim());body=hi<0?[]:rows.slice(hi+1);
+    const w=Math.max(head.length,...body.slice(0,200).map(r=>r.length),1);
+    while(head.length<w)head.push("");
+    const okIdx=k=>Number.isInteger(k)&&k>=0&&k<w;
+    let c=okIdx(imp.ci)&&firstLoad?imp.ci:head.findIndex(h=>/klient/i.test(h));
+    let p=okIdx(imp.pi)&&firstLoad?imp.pi:head.findIndex(h=>/projekt/i.test(h));
+    if(!okIdx(c))c=okIdx(colIdx(cfg.ms.colC))?colIdx(cfg.ms.colC):0;
+    if(!okIdx(p))p=okIdx(colIdx(cfg.ms.colP))?colIdx(cfg.ms.colP):(c===0?1:0);
+    ci=c;pi=p;firstLoad=false;
+  };
+  prep();
+  const opts=sel=>head.map((h,i)=>'<option value="'+i+'"'+(i===sel?' selected':'')+'>'+colL(i)+(h?' – '+esc(h.slice(0,40)):'')+'</option>').join("");
+  const sheetOpts=()=>book.sheetsInfo.filter(x=>!x.hidden||x.name===sheetName).map(x=>'<option'+(x.name===sheetName?' selected':'')+'>'+esc(x.name)+(x.hidden?' (ukryty)':'')+'</option>').join("");
+  const build=()=>{
+    const rows=body.filter(r=>!(skip&&r.hidden));
+    return {list:plistDedupe(rows.map(r=>({c:cellStr(r[ci]),p:cellStr(r[pi])})).filter(x=>x.c&&x.p)),hid:body.filter(r=>r.hidden).length};
+  };
   openDlg('<div class="dlg-body"><h2>Wczytaj listę projektów</h2><p class="sum">'+esc(file.name)+'</p>'
-    +'<div class="two"><div><label for="m_c" style="margin-top:4px">Kolumna z klientem</label><select class="in" id="m_c">'+opts(ci)+'</select></div>'
-    +'<div><label for="m_p" style="margin-top:4px">Kolumna z projektem</label><select class="in" id="m_p">'+opts(pi)+'</select></div></div>'
+    +(isX?'<label for="m_s" style="margin-top:4px">Arkusz</label><select class="in" id="m_s">'+sheetOpts()+'</select>':'')
+    +'<div class="two"><div><label for="m_c">Kolumna z klientem</label><select class="in" id="m_c"></select></div>'
+    +'<div><label for="m_p">Kolumna z projektem</label><select class="in" id="m_p"></select></div></div>'
+    +(isX?'<label class="chk"><input type="checkbox" id="m_h"'+(skip?' checked':'')+'> Tylko widoczne wiersze (pomiń ukryte i odfiltrowane)</label>':'')
     +'<div id="m_prev"></div><div class="row2"><button class="btn ghost" data-close>Anuluj</button><button class="btn go" id="m_ok">Zastąp listę</button></div></div>',
   e=>{
     if(!e.target.closest("#m_ok"))return;
-    const l=build();
-    if(!l.length){toast("Brak par klient–projekt w wybranych kolumnach");return}
-    cfg.plist=l;cfg.plistSrc={name:file.name,at:Date.now()};saveCfg();dlg.close();renderMgr();
-    toast("Wczytano "+l.length+" projektów od "+clientsList().length+" klientów");
+    const r=build();
+    if(!r.list.length){toast("Brak par klient–projekt w wybranych kolumnach");return}
+    cfg.plist=r.list;cfg.plistSrc={name:file.name+(sheetName?" ("+sheetName+")":""),at:Date.now()};
+    cfg.imp={sheet:sheetName,ci,pi,skipHidden:skip};
+    saveCfg();dlg.close();renderMgr();
+    toast("Wczytano "+r.list.length+" projektów od "+clientsList().length+" klientów");
   },
   ()=>{
-    const upd=()=>{const l=build();$("#m_prev").innerHTML='<p class="muted" style="margin-top:12px">Znaleziono '+l.length+' projektów od '+new Set(l.map(x=>x.c)).size+' klientów. Przykład:</p><ul class="prev">'+l.slice(0,5).map(x=>'<li>'+esc(x.c)+' · '+esc(x.p)+'</li>').join("")+'</ul>'};
-    $("#m_c").onchange=upd;$("#m_p").onchange=upd;upd();
+    const fill=()=>{$("#m_c").innerHTML=opts(ci);$("#m_p").innerHTML=opts(pi)};
+    const upd=()=>{
+      const r=build();
+      $("#m_prev").innerHTML='<p class="muted" style="margin-top:12px">Znaleziono <b>'+r.list.length+'</b> projektów od <b>'+new Set(r.list.map(x=>x.c)).size+'</b> klientów'
+        +(isX?(skip?' (pominięto ukryte wiersze: '+r.hid+')':' (z ukrytymi wierszami: '+r.hid+')'):'')+'. Przykład:</p><ul class="prev">'+r.list.slice(0,5).map(x=>'<li>'+esc(x.c)+' · '+esc(x.p)+'</li>').join("")+'</ul>';
+    };
+    fill();upd();
+    $("#m_c").onchange=()=>{ci=+$("#m_c").value;upd()};
+    $("#m_p").onchange=()=>{pi=+$("#m_p").value;upd()};
+    const h=$("#m_h");if(h)h.onchange=()=>{skip=h.checked;upd()};
+    const ss=$("#m_s");
+    if(ss)ss.onchange=async()=>{
+      const want=ss.value.replace(/ \(ukryty\)$/,"");
+      try{book=await load(want)}catch(err){toast("Nie udało się odczytać arkusza");return}
+      sheetName=book.sheet;prep();fill();upd();
+    };
   });
 }
-
 
 /* ==================================================================
    MICROSOFT 365 – lista klientów i projektów z Excela w OneDrive / SharePoint
@@ -2712,10 +2758,11 @@ function msRowsToList(rows,ci,pi){
 }
 /* odczyt przez Excel w Microsoft 365 (arkusz → zakres kolumn) */
 async function msReadWorkbook(){
-  const sj=await graph(itemBase()+"/workbook/worksheets?$select=id,name,position");
+  const sj=await graph(itemBase()+"/workbook/worksheets?$select=id,name,position,visibility");
   const sheets=(sj.value||[]).sort((a,b)=>a.position-b.position);
+  const visible=sheets.filter(x=>!x.visibility||x.visibility==="Visible");
   if(!sheets.length)throw msErr("api","Plik nie ma arkuszy.");
-  const sh=cfg.ms.sheet?sheets.find(s=>s.name===cfg.ms.sheet):sheets[0];
+  const sh=cfg.ms.sheet?sheets.find(s=>s.name===cfg.ms.sheet):(visible[0]||sheets[0]);
   if(!sh)throw msErr("cfg","W pliku nie ma arkusza „"+cfg.ms.sheet+"”.");
   const ws=itemBase()+"/workbook/worksheets/"+encodeURIComponent(sh.id);
   const ur=await graph(ws+"/usedRange(valuesOnly=true)?$select=address,rowIndex,rowCount");
@@ -2723,10 +2770,10 @@ async function msReadWorkbook(){
   const ci=colIdx(cfg.ms.colC),pi=colIdx(cfg.ms.colP),lo=Math.min(ci,pi),hi=Math.max(ci,pi);
   let rows=[];
   if(last>=first){
-    const rg=await graph(ws+"/range(address='"+colL(lo)+first+":"+colL(hi)+last+"')?$select=text");
+    const rg=await graph(ws+"/range(address='"+colL(lo)+first+":"+colL(hi)+last+"')"+(cfg.ms.skipHidden!==false?"/visibleView":"")+"?$select=text");
     rows=(rg.text||[]).map(r=>{const a=[];a[ci]=r[ci-lo];a[pi]=r[pi-lo];return a});
   }
-  return {list:msRowsToList(rows,ci,pi),sheet:sh.name,sheets:sheets.map(s=>s.name)};
+  return {list:msRowsToList(rows,ci,pi),sheet:sh.name,sheets:visible.map(s=>s.name)};
 }
 /* zapasowo: pobranie całego pliku i odczyt na urządzeniu */
 async function msReadDownload(){
@@ -2736,9 +2783,10 @@ async function msReadDownload(){
   let r;try{r=await fetch(url)}catch(e){throw msErr("net","Nie udało się pobrać pliku z Microsoft 365.")}
   if(!r.ok)throw msErr("api","Pobieranie pliku nieudane [HTTP "+r.status+"].");
   const book=await readXlsxBook(await r.arrayBuffer(),cfg.ms.sheet);
+  book.sheets=book.sheetsInfo.filter(x=>!x.hidden).map(x=>x.name);
   if(cfg.ms.sheet&&book.sheet!==cfg.ms.sheet)throw msErr("cfg","W pliku nie ma arkusza „"+cfg.ms.sheet+"”.");
   const first=Math.max(1,parseInt(cfg.ms.first,10)||1),ci=colIdx(cfg.ms.colC),pi=colIdx(cfg.ms.colP);
-  return {list:msRowsToList(book.rows.filter(r=>(r.rowNum||0)>=first),ci,pi),sheet:book.sheet,sheets:book.sheets};
+  return {list:msRowsToList(book.rows.filter(r=>(r.rowNum||0)>=first&&!(cfg.ms.skipHidden!==false&&r.hidden)),ci,pi),sheet:book.sheet,sheets:book.sheets};
 }
 async function msFetchList(){
   await msResolve();
@@ -2814,6 +2862,7 @@ function msPanel(){
     +'<div class="cols3"><div><label for="msColC">Kolumna klienta</label><input class="in" id="msColC" maxlength="3" autocomplete="off" value="'+esc(cfg.ms.colC)+'"></div>'
     +'<div><label for="msColP">Kolumna projektu</label><input class="in" id="msColP" maxlength="3" autocomplete="off" value="'+esc(cfg.ms.colP)+'"></div>'
     +'<div><label for="msFirst">Dane od wiersza</label><input class="in" id="msFirst" type="number" inputmode="numeric" min="1" step="1" value="'+esc(cfg.ms.first)+'"></div></div>'
+    +'<label class="chk"><input type="checkbox" id="msHid"'+(cfg.ms.skipHidden!==false?' checked':'')+'> Tylko widoczne wiersze (pomiń ukryte i odfiltrowane)</label>'
     +'<div class="fileline"><button class="btn brand" data-ms="save">Zapisz i sprawdź</button><button class="btn ghost" data-ms="refresh">Odśwież teraz</button></div>'
     +'<div id="msStat" aria-live="polite">'+msStatusHtml()+'</div>'
     +'<details class="ms-adv"'+(ids?'':' open')+'><summary>Identyfikatory aplikacji (Microsoft Entra)</summary>'
@@ -2829,7 +2878,7 @@ function msSaveInputs(){
   if(c===p)return {ok:false,msg:"Kolumna klienta i projektu muszą być różne."};
   if(!(first>=1&&first<=1048576))return {ok:false,msg:"„Dane od wiersza” to numer wiersza, np. 2."};
   if(link!==cfg.ms.resolvedFor){cfg.ms.driveId="";cfg.ms.itemId="";cfg.ms.fileName=""}
-  Object.assign(cfg.ms,{link,sheet:g("msSheet")||"",colC:c,colP:p,first,clientId:clean(g("msCid")),tenantId:clean(g("msTid"))});
+  Object.assign(cfg.ms,{link,sheet:g("msSheet")||"",colC:c,colP:p,first,skipHidden:!!($("#msHid")&&$("#msHid").checked),clientId:clean(g("msCid")),tenantId:clean(g("msTid"))});
   saveCfg();return {ok:true};
 }
 function msAction(a){
